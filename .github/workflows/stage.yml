@@ -96,7 +96,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "download failed" }
             New-Item -ItemType Directory -Force $env:ROOT | Out-Null
             7z x D:\state\state.7z "-o$env:ROOT" -y -bso0 -bsp0
-            if ($LASTEXITCODE -ne 0) { throw "extract failed" }
+            if ($LASTEXITCODE -gt 1) { throw "extract failed" }
             Remove-Item -Recurse -Force D:\state
             $cached = if (Test-Path "$env:ROOT\cache_commit.txt") { (Get-Content "$env:ROOT\cache_commit.txt" -Raw).Trim() } else { '' }
             if ($cached -ne $commit) { throw "cached tree is for commit '$cached', need '$commit'" }
@@ -161,7 +161,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force $env:ROOT | Out-Null
           7z x D:\state\state.7z "-o$env:ROOT" -y -bso0 -bsp0
-          if ($LASTEXITCODE -ne 0) { throw "extract failed" }
+          if ($LASTEXITCODE -gt 1) { throw "extract failed" }
           Remove-Item -Recurse -Force D:\state
 
       - name: Generate build files
@@ -257,6 +257,8 @@ jobs:
           7z a -t7z -mx=1 -mmt=on D:\state.7z src .gclient .gclient_entries cache_commit.txt applied_patches "-xr!.git" -bso0 -bsp0
           if ($LASTEXITCODE -gt 1) { throw "archive failed" }
           "{0:N1} GB" -f ((Get-Item D:\state.7z).Length / 1GB)
+          # 7z exits with 1 for warnings (dangling symlinks in the tree).
+          exit 0
 
       - name: Upload tree
         if: always() && steps.build.outputs.finished != ''
