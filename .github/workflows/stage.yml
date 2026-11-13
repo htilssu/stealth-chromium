@@ -6,6 +6,10 @@ on:
       stage:
         required: true
         type: number
+      previous:
+        description: Stage whose tree is restored (0 for the first stage)
+        required: true
+        type: number
     outputs:
       finished:
         description: "'true' when chrome finished building in this stage"
@@ -101,7 +105,7 @@ jobs:
         if: inputs.stage > 1
         uses: actions/download-artifact@v4
         with:
-          name: build-state-${{ inputs.stage - 1 }}
+          name: build-state-${{ inputs.previous }}
           path: C:\state
 
       - name: Restore previous stage
