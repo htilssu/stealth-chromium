@@ -18,8 +18,8 @@ on:
 env:
   DEPOT_TOOLS_WIN_TOOLCHAIN: 0
   GCLIENT_SUPPRESS_GIT_VERSION_WARNING: 1
-  # Short root: Chromium paths get long.
-  ROOT: C:\c
+  # Short root: Chromium paths get long. D: is the runner drive with space.
+  ROOT: D:\c
   # Minutes after job start at which the build is interrupted, leaving time
   # to archive and upload the tree before the 6-hour job limit.
   BUILD_DEADLINE_MINUTES: 235
@@ -58,7 +58,14 @@ jobs:
         run: |
           $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.28000.0\um"
           if (-not (Test-Path $inc)) {
-            winget install --id Microsoft.WindowsSDK.10.0.28000 --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+            # winget's own silent install of this package fails with
+            # E_INVALIDARG, so download the installer and run it directly.
+            winget download --id Microsoft.WindowsSDK.10.0.28000 --source winget -d D:\sdk --accept-package-agreements --accept-source-agreements --disable-interactivity
+            $setup = Get-ChildItem D:\sdk -Filter *.exe | Select-Object -First 1
+            if (-not $setup) { throw "SDK installer was not downloaded" }
+            $p = Start-Process -FilePath $setup.FullName -ArgumentList '/features', '+', '/quiet', '/norestart', '/log', 'D:\sdk\install.log' -Wait -PassThru
+            Write-Host "SDK installer exit code: $($p.ExitCode)"
+            if (-not (Test-Path $inc)) { Get-ChildItem D:\sdk; Get-Content D:\sdk\install.log -Tail 40 -ErrorAction SilentlyContinue }
           }
           Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" | Select-Object Name
           if (-not (Test-Path $inc)) { throw "Windows SDK 10.0.28000.0 is not installed" }
@@ -106,15 +113,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: build-state-${{ inputs.previous }}
-          path: C:\state
+          path: D:\state
 
       - name: Restore previous stage
         if: inputs.stage > 1
         run: |
           New-Item -ItemType Directory -Force $env:ROOT | Out-Null
-          7z x C:\state\state.7z "-o$env:ROOT" -y -bso0 -bsp0
+          7z x D:\state\state.7z "-o$env:ROOT" -y -bso0 -bsp0
           if ($LASTEXITCODE -ne 0) { throw "extract failed" }
-          Remove-Item -Recurse -Force C:\state
+          Remove-Item -Recurse -Force D:\state
 
       - name: Build
         id: build
@@ -156,7 +163,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ inputs.stage }}
-          path: C:\c\build.log
+          path: D:\c\build.log
           if-no-files-found: ignore
           retention-days: 7
 
@@ -164,16 +171,16 @@ jobs:
         if: steps.build.outputs.finished == 'false'
         run: |
           Set-Location $env:ROOT
-          7z a -t7z -mx=1 -mmt=on C:\state.7z src .gclient .gclient_entries "-xr!.git" -bso0 -bsp0
+          7z a -t7z -mx=1 -mmt=on D:\state.7z src .gclient .gclient_entries "-xr!.git" -bso0 -bsp0
           if ($LASTEXITCODE -gt 1) { throw "archive failed" }
-          "{0:N1} GB" -f ((Get-Item C:\state.7z).Length / 1GB)
+          "{0:N1} GB" -f ((Get-Item D:\state.7z).Length / 1GB)
 
       - name: Upload tree for next stage
         if: steps.build.outputs.finished == 'false'
         uses: actions/upload-artifact@v4
         with:
           name: build-state-${{ inputs.stage }}
-          path: C:\state.7z
+          path: D:\state.7z
           compression-level: 0
           retention-days: 1
 
@@ -181,7 +188,7 @@ jobs:
         if: steps.build.outputs.finished == 'true'
         run: |
           $out = "$env:ROOT\src\out\Release"
-          $dst = "C:\pkg\chrome"
+          $dst = "D:\pkg\chrome"
           New-Item -ItemType Directory -Force $dst | Out-Null
           $patterns = 'chrome.exe', 'chrome_proxy.exe', 'chrome_pwa_launcher.exe', 'elevation_service.exe', 'notification_helper.exe', '*.dll', '*.pak', '*.bin', '*.dat', '*.manifest', '*.json'
           foreach ($pattern in $patterns) {
@@ -190,14 +197,14 @@ jobs:
           foreach ($dir in 'locales', 'MEIPreload', 'PrivacySandboxAttestationsPreloaded', 'IwaKeyDistribution') {
             if (Test-Path "$out\$dir") { Copy-Item -Recurse "$out\$dir" "$dst\$dir" }
           }
-          7z a -tzip C:\pkg\chrome-win64.zip "$dst" -bso0 -bsp0
-          "{0:N1} MB" -f ((Get-Item C:\pkg\chrome-win64.zip).Length / 1MB)
+          7z a -tzip D:\pkg\chrome-win64.zip "$dst" -bso0 -bsp0
+          "{0:N1} MB" -f ((Get-Item D:\pkg\chrome-win64.zip).Length / 1MB)
 
       - name: Upload chrome
         if: steps.build.outputs.finished == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: chrome-win64
-          path: C:\pkg\chrome-win64.zip
+          path: D:\pkg\chrome-win64.zip
           compression-level: 0
           retention-days: 14
