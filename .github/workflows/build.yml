@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+# A Chromium build does not fit in one 6-hour job, so it is split into
+# stages. Each stage builds for a fixed time budget, then hands the whole
+# tree (sources + out/) to the next stage as an artifact. Stages after the
+# one that finishes the build are skipped.
+jobs:
+  stage-1:
+    uses: ./.github/workflows/stage.yml
+    with:
+      stage: 1
+  stage-2:
+    needs: stage-1
+    if: needs.stage-1.outputs.finished == 'false'
+    uses: ./.github/workflows/stage.yml
+    with:
+      stage: 2
+  stage-3:
+    needs: stage-2
+    if: needs.stage-2.outputs.finished == 'false'
+    uses: ./.github/workflows/stage.yml
+    with:
+      stage: 3
+  stage-4:
+    needs: stage-3
+    if: needs.stage-3.outputs.finished == 'false'
+    uses: ./.github/workflows/stage.yml
+    with:
+      stage: 4
+  stage-5:
+    needs: stage-4
+    if: needs.stage-4.outputs.finished == 'false'
+    uses: ./.github/workflows/stage.yml
+    with:
+      stage: 5
+  stage-6:
+    needs: stage-5
+    if: needs.stage-5.outputs.finished == 'false'
+    uses: ./.github/workflows/stage.yml
+    with:
+      stage: 6
+  stage-7:
+    needs: stage-6
+    if: needs.stage-6.outputs.finished == 'false'
+    uses: ./.github/workflows/stage.yml
+    with:
+      stage: 7
+  stage-8:
+    needs: stage-7
+    if: needs.stage-7.outputs.finished == 'false'
+    uses: ./.github/workflows/stage.yml
+    with:
+      stage: 8

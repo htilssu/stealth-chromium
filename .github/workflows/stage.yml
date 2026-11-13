@@ -1,0 +1,199 @@
+name: Build stage
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        required: true
+        type: number
+    outputs:
+      finished:
+        description: "'true' when chrome finished building in this stage"
+        value: ${{ jobs.build.outputs.finished }}
+
+env:
+  DEPOT_TOOLS_WIN_TOOLCHAIN: 0
+  GCLIENT_SUPPRESS_GIT_VERSION_WARNING: 1
+  # Short root: Chromium paths get long.
+  ROOT: C:\c
+  # Minutes after job start at which the build is interrupted, leaving time
+  # to archive and upload the tree before the 6-hour job limit.
+  BUILD_DEADLINE_MINUTES: 235
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.build.outputs.finished }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Record job start
+        run: |
+          "JOB_START=$((Get-Date).ToUniversalTime().ToString('o'))" >> $env:GITHUB_ENV
+          Get-Volume | Where-Object DriveLetter | Format-Table DriveLetter, @{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}}
+
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Git settings
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+          git config --global advice.detachedHead false
+
+      - name: Install depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          "C:\depot_tools" >> $env:GITHUB_PATH
+
+      - name: Install Windows SDK 10.0.28000
+        run: |
+          $inc = "${env:ProgramFiles(x86)}\Windows Kits\10\Include\10.0.28000.0\um"
+          if (-not (Test-Path $inc)) {
+            winget install --id Microsoft.WindowsSDK.10.0.28000 --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+          }
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" | Select-Object Name
+          if (-not (Test-Path $inc)) { throw "Windows SDK 10.0.28000.0 is not installed" }
+
+      - name: Fetch Chromium and apply patches
+        if: inputs.stage == 1
+        run: |
+          $commit = (Get-Content repo\chromium_commit.txt -Raw).Trim()
+          New-Item -ItemType Directory -Force $env:ROOT | Out-Null
+          Set-Location $env:ROOT
+          git init -q src
+          Set-Location src
+          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          git fetch --depth 1 origin $commit
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+          git checkout -q FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw "git checkout failed" }
+          Set-Location $env:ROOT
+          @'
+          solutions = [
+            {
+              "name": "src",
+              "url": "https://chromium.googlesource.com/chromium/src.git",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {},
+            },
+          ]
+          '@ -replace '(?m)^          ', '' | Set-Content -Encoding ascii .gclient
+          cmd /c "gclient sync --no-history -D"
+          if ($LASTEXITCODE -ne 0) { throw "gclient sync failed" }
+          Set-Location src
+          Get-ChildItem "$env:GITHUB_WORKSPACE\repo\patches\*.patch" | Sort-Object Name | ForEach-Object {
+            Write-Host "Applying $($_.Name)"
+            git apply --whitespace=nowarn $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "failed to apply $($_.Name)" }
+          }
+          New-Item -ItemType Directory -Force out\Release | Out-Null
+          Copy-Item "$env:GITHUB_WORKSPACE\repo\args.gn" out\Release\args.gn
+          cmd /c "gn gen out\Release"
+          if ($LASTEXITCODE -ne 0) { throw "gn gen failed" }
+
+      - name: Download previous stage
+        if: inputs.stage > 1
+        uses: actions/download-artifact@v4
+        with:
+          name: build-state-${{ inputs.stage - 1 }}
+          path: C:\state
+
+      - name: Restore previous stage
+        if: inputs.stage > 1
+        run: |
+          New-Item -ItemType Directory -Force $env:ROOT | Out-Null
+          7z x C:\state\state.7z "-o$env:ROOT" -y -bso0 -bsp0
+          if ($LASTEXITCODE -ne 0) { throw "extract failed" }
+          Remove-Item -Recurse -Force C:\state
+
+      - name: Build
+        id: build
+        run: |
+          Set-Location "$env:ROOT\src"
+          $deadline = ([datetime]::Parse($env:JOB_START)).ToUniversalTime().AddMinutes([int]$env:BUILD_DEADLINE_MINUTES)
+          $log = "$env:ROOT\build.log"
+          $p = Start-Process -FilePath cmd -ArgumentList '/c', "autoninja -C out\Release chrome > `"$log`" 2>&1" -PassThru -NoNewWindow
+          $null = $p.Handle
+          $tick = 0
+          while (-not $p.HasExited -and (Get-Date).ToUniversalTime() -lt $deadline) {
+            Start-Sleep -Seconds 30
+            $tick++
+            if ($tick % 10 -eq 0 -and (Test-Path $log)) {
+              Get-Content $log -Tail 2
+            }
+          }
+          if (-not $p.HasExited) {
+            Write-Host "Time budget reached; interrupting the build."
+            taskkill /PID $p.Id /T /F | Out-Null
+            foreach ($name in 'siso.exe', 'ninja.exe', 'clang-cl.exe', 'lld-link.exe') {
+              taskkill /IM $name /F 2>$null | Out-Null
+            }
+            Start-Sleep -Seconds 10
+            "finished=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $p.WaitForExit()
+          if ($p.ExitCode -ne 0) {
+            Write-Host "Build failed with exit code $($p.ExitCode)"
+            Select-String -Path $log -Pattern 'error:|FAILED:' -Context 0, 12 | Select-Object -First 40 | ForEach-Object { $_.ToString() }
+            Get-Content $log -Tail 60
+            exit 1
+          }
+          "finished=true" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ inputs.stage }}
+          path: C:\c\build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Archive tree for next stage
+        if: steps.build.outputs.finished == 'false'
+        run: |
+          Set-Location $env:ROOT
+          7z a -t7z -mx=1 -mmt=on C:\state.7z src .gclient .gclient_entries "-xr!.git" -bso0 -bsp0
+          if ($LASTEXITCODE -gt 1) { throw "archive failed" }
+          "{0:N1} GB" -f ((Get-Item C:\state.7z).Length / 1GB)
+
+      - name: Upload tree for next stage
+        if: steps.build.outputs.finished == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-state-${{ inputs.stage }}
+          path: C:\state.7z
+          compression-level: 0
+          retention-days: 1
+
+      - name: Package chrome
+        if: steps.build.outputs.finished == 'true'
+        run: |
+          $out = "$env:ROOT\src\out\Release"
+          $dst = "C:\pkg\chrome"
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          $patterns = 'chrome.exe', 'chrome_proxy.exe', 'chrome_pwa_launcher.exe', 'elevation_service.exe', 'notification_helper.exe', '*.dll', '*.pak', '*.bin', '*.dat', '*.manifest', '*.json'
+          foreach ($pattern in $patterns) {
+            Get-ChildItem -Path $out -Filter $pattern -File | Copy-Item -Destination $dst
+          }
+          foreach ($dir in 'locales', 'MEIPreload', 'PrivacySandboxAttestationsPreloaded', 'IwaKeyDistribution') {
+            if (Test-Path "$out\$dir") { Copy-Item -Recurse "$out\$dir" "$dst\$dir" }
+          }
+          7z a -tzip C:\pkg\chrome-win64.zip "$dst" -bso0 -bsp0
+          "{0:N1} MB" -f ((Get-Item C:\pkg\chrome-win64.zip).Length / 1MB)
+
+      - name: Upload chrome
+        if: steps.build.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-win64
+          path: C:\pkg\chrome-win64.zip
+          compression-level: 0
+          retention-days: 14

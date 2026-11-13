@@ -1,0 +1,706 @@
+diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
+index 833293873f..19ad19fff1 100644
+--- a/components/embedder_support/user_agent_utils.cc
++++ b/components/embedder_support/user_agent_utils.cc
+@@ -29,6 +29,7 @@
+ #include "components/version_info/version_info.h"
+ #include "net/http/http_util.h"
+ #include "third_party/blink/public/common/features.h"
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ #include "third_party/blink/public/common/user_agent/user_agent_metadata.h"
+ 
+ #if BUILDFLAG(IS_WIN)
+@@ -446,7 +447,8 @@ std::string BuildUserAgentFromProduct(const std::string& product) {
+ // depending on the Reduce User-Agent reduction phase features.
+ std::string GetUserAgentInternal() {
+   std::string product = GetProductAndVersion();
+-  if (base::CommandLine::ForCurrentProcess()->HasSwitch(kHeadless)) {
++  if (base::CommandLine::ForCurrentProcess()->HasSwitch(kHeadless) &&
++      !blink::fingerprint::IsEnabled()) {
+     product.insert(0, "Headless");
+   }
+ 
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 5fd08e7d58..7c54689b34 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -4049,6 +4049,12 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+       blink::switches::kEnablePreferCompositingToLCDText,
+       blink::switches::kEnableRGBA4444Textures,
+       blink::switches::kEnableRasterSideDarkModeForImages,
++      blink::switches::kFingerprint,
++      blink::switches::kFingerprintDeviceMemory,
++      blink::switches::kFingerprintGpuRenderer,
++      blink::switches::kFingerprintGpuVendor,
++      blink::switches::kFingerprintHardwareConcurrency,
++      blink::switches::kFingerprintPlatform,
+ #if BUILDFLAG(IS_CHROMEOS)
+       blink::switches::kEnableOverlaysAndLowLatencyUsageForWebGL,
+ #endif
+diff --git a/third_party/blink/common/BUILD.gn b/third_party/blink/common/BUILD.gn
+index debd85e087..b75f0e97f1 100644
+--- a/third_party/blink/common/BUILD.gn
++++ b/third_party/blink/common/BUILD.gn
+@@ -154,6 +154,7 @@ source_set("common") {
+     "dom_storage/session_storage_namespace_id.cc",
+     "features.cc",
+     "fenced_frame/fenced_frame_utils.cc",
++    "fingerprint/fingerprint_config.cc",
+     "fenced_frame/redacted_fenced_frame_config.cc",
+     "fenced_frame/redacted_fenced_frame_config_mojom_traits.cc",
+     "fetch/fetch_api_request_body_mojom_traits.cc",
+diff --git a/third_party/blink/common/device_memory/approximated_device_memory.cc b/third_party/blink/common/device_memory/approximated_device_memory.cc
+index 7fd53ebba0..1fbd491090 100644
+--- a/third_party/blink/common/device_memory/approximated_device_memory.cc
++++ b/third_party/blink/common/device_memory/approximated_device_memory.cc
+@@ -4,11 +4,14 @@
+ 
+ #include "third_party/blink/public/common/device_memory/approximated_device_memory.h"
+ 
++#include <optional>
++
+ #include "base/byte_size.h"
+ #include "base/check_op.h"
+ #include "base/feature_list.h"
+ #include "base/system/sys_info.h"
+ #include "third_party/blink/public/common/features.h"
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ 
+ namespace blink {
+ 
+@@ -27,6 +30,12 @@ void ApproximatedDeviceMemory::Initialize() {
+ 
+ // static
+ float ApproximatedDeviceMemory::GetApproximatedDeviceMemory() {
++  // Applied here rather than in NavigatorDeviceMemory so that the
++  // Sec-CH-Device-Memory client hint agrees with navigator.deviceMemory.
++  if (std::optional<float> memory_override =
++          fingerprint::DeviceMemoryOverride()) {
++    return *memory_override;
++  }
+   return approximated_device_memory_gb_;
+ }
+ 
+diff --git a/third_party/blink/common/fingerprint/fingerprint_config.cc b/third_party/blink/common/fingerprint/fingerprint_config.cc
+new file mode 100644
+index 0000000000..6125251882
+--- /dev/null
++++ b/third_party/blink/common/fingerprint/fingerprint_config.cc
+@@ -0,0 +1,187 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
++
++#include <string_view>
++
++#include "base/command_line.h"
++#include "base/hash/hash.h"
++#include "base/no_destructor.h"
++#include "base/strings/string_number_conversions.h"
++#include "third_party/blink/public/common/switches.h"
++
++namespace blink::fingerprint {
++
++namespace {
++
++uint64_t SplitMix64(uint64_t x) {
++  x += 0x9E3779B97F4A7C15ull;
++  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
++  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
++  return x ^ (x >> 31);
++}
++
++struct Config {
++  Config() {
++    const base::CommandLine* command_line =
++        base::CommandLine::ForCurrentProcess();
++    if (!command_line->HasSwitch(switches::kFingerprint)) {
++      return;
++    }
++    const std::string seed_string =
++        command_line->GetSwitchValueASCII(switches::kFingerprint);
++    if (seed_string.empty()) {
++      return;
++    }
++    enabled = true;
++    // Accept plain integers, but fall back to hashing so that arbitrary
++    // strings (profile names, UUIDs) can be used as seeds too.
++    uint64_t numeric_seed = 0;
++    if (base::StringToUint64(seed_string, &numeric_seed)) {
++      seed = SplitMix64(numeric_seed);
++    } else {
++      seed = SplitMix64(base::PersistentHash(seed_string));
++    }
++
++    unsigned concurrency = 0;
++    if (base::StringToUint(
++            command_line->GetSwitchValueASCII(
++                switches::kFingerprintHardwareConcurrency),
++            &concurrency) &&
++        concurrency > 0) {
++      hardware_concurrency = concurrency;
++    }
++
++    double memory_gb = 0;
++    if (base::StringToDouble(command_line->GetSwitchValueASCII(
++                                 switches::kFingerprintDeviceMemory),
++                             &memory_gb) &&
++        memory_gb > 0) {
++      device_memory = static_cast<float>(memory_gb);
++    }
++
++    platform = ReadString(*command_line, switches::kFingerprintPlatform);
++    gpu_vendor = ReadString(*command_line, switches::kFingerprintGpuVendor);
++    gpu_renderer = ReadString(*command_line, switches::kFingerprintGpuRenderer);
++  }
++
++  static std::optional<std::string> ReadString(
++      const base::CommandLine& command_line,
++      std::string_view name) {
++    if (!command_line.HasSwitch(name)) {
++      return std::nullopt;
++    }
++    // GetSwitchValueUTF8 rather than ASCII: GPU renderer strings contain
++    // characters such as "(R)" / "(TM)" and occasionally non-ASCII ones.
++    std::string value = command_line.GetSwitchValueUTF8(name);
++    if (value.empty()) {
++      return std::nullopt;
++    }
++    return value;
++  }
++
++  bool enabled = false;
++  uint64_t seed = 0;
++  std::optional<unsigned> hardware_concurrency;
++  std::optional<float> device_memory;
++  std::optional<std::string> platform;
++  std::optional<std::string> gpu_vendor;
++  std::optional<std::string> gpu_renderer;
++};
++
++const Config& GetConfig() {
++  static const base::NoDestructor<Config> config;
++  return *config;
++}
++
++}  // namespace
++
++bool IsEnabled() {
++  return GetConfig().enabled;
++}
++
++uint64_t Seed() {
++  return GetConfig().seed;
++}
++
++uint64_t Mix(uint64_t value) {
++  return SplitMix64(GetConfig().seed ^ SplitMix64(value));
++}
++
++std::optional<unsigned> HardwareConcurrencyOverride() {
++  return GetConfig().hardware_concurrency;
++}
++
++std::optional<float> DeviceMemoryOverride() {
++  return GetConfig().device_memory;
++}
++
++std::optional<std::string> PlatformOverride() {
++  return GetConfig().platform;
++}
++
++std::optional<std::string> GpuVendorOverride() {
++  return GetConfig().gpu_vendor;
++}
++
++std::optional<std::string> GpuRendererOverride() {
++  return GetConfig().gpu_renderer;
++}
++
++void PerturbPixels8888(base::span<uint8_t> pixels) {
++  if (!IsEnabled()) {
++    return;
++  }
++  // `previous` holds the *original* value of the preceding pixel so that the
++  // decision for each pixel depends only on unmodified content.
++  uint32_t previous = 0;
++  bool has_previous = false;
++  uint64_t index = 0;
++  while (pixels.size() >= 4) {
++    base::span<uint8_t> pixel = pixels.first(4u);
++    const uint32_t value = (static_cast<uint32_t>(pixel[0]) << 24) |
++                           (static_cast<uint32_t>(pixel[1]) << 16) |
++                           (static_cast<uint32_t>(pixel[2]) << 8) |
++                           static_cast<uint32_t>(pixel[3]);
++    // Only touch pixels on a colour transition (anti-aliased edges, text,
++    // gradients). Flat fills and fully transparent pixels stay exact, which
++    // keeps trivially verifiable content (e.g. a solid fillRect) unchanged.
++    if (has_previous && value != previous && pixel[3] != 0) {
++      const uint64_t h = Mix((index << 32) ^ value);
++      if ((h & 0xF) == 0) {
++        const size_t channel = static_cast<size_t>((h >> 4) % 3);
++        const uint8_t flipped = static_cast<uint8_t>(pixel[channel] ^ 1u);
++        // Never exceed alpha, so premultiplied pixels stay valid.
++        if (flipped <= pixel[3]) {
++          pixel[channel] = flipped;
++        }
++      }
++    }
++    previous = value;
++    has_previous = true;
++    ++index;
++    pixels = pixels.subspan(4u);
++  }
++}
++
++void PerturbAudioSamples(base::span<float> samples) {
++  if (!IsEnabled()) {
++    return;
++  }
++  // Gain within 1 +/- 5e-6: far below audibility, but enough to change the
++  // low-order bits that audio fingerprints sum over.
++  const double unit = static_cast<double>(Mix(0x617564696F) >> 11) /
++                      static_cast<double>(1ull << 53);
++  float gain = static_cast<float>(1.0 + (unit - 0.5) * 1e-5);
++  if (gain == 1.0f) {
++    // The offset rounded away in single precision; keep the noise non-zero.
++    gain = 1.0f + 1e-6f;
++  }
++  for (float& sample : samples) {
++    sample *= gain;
++  }
++}
++
++}  // namespace blink::fingerprint
+diff --git a/third_party/blink/common/switches.cc b/third_party/blink/common/switches.cc
+index 5cc943a60b..c999bea6d1 100644
+--- a/third_party/blink/common/switches.cc
++++ b/third_party/blink/common/switches.cc
+@@ -34,6 +34,26 @@ const char kBlinkSettings[] = "blink-settings";
+ // the contrast.
+ const char kDarkModeSettings[] = "dark-mode-settings";
+ 
++// Enables seed-keyed fingerprint variation. The value is the seed (an integer
++// or an arbitrary string); the same seed always yields the same fingerprint.
++// The --fingerprint-* switches below are ignored unless this one is present.
++// See third_party/blink/public/common/fingerprint/fingerprint_config.h.
++const char kFingerprint[] = "fingerprint";
++
++// navigator.deviceMemory value, in GiB.
++const char kFingerprintDeviceMemory[] = "fingerprint-device-memory";
++
++// Strings reported through the WEBGL_debug_renderer_info extension.
++const char kFingerprintGpuRenderer[] = "fingerprint-gpu-renderer";
++const char kFingerprintGpuVendor[] = "fingerprint-gpu-vendor";
++
++// navigator.hardwareConcurrency value.
++const char kFingerprintHardwareConcurrency[] =
++    "fingerprint-hardware-concurrency";
++
++// navigator.platform value, e.g. "Win32", "MacIntel", "Linux x86_64".
++const char kFingerprintPlatform[] = "fingerprint-platform";
++
+ // Overrides data: URLs in SVGUseElement deprecation through enterprise policy.
+ const char kDataUrlInSvgUseEnabled[] = "data-url-in-svg-use-enabled";
+ 
+diff --git a/third_party/blink/public/common/BUILD.gn b/third_party/blink/public/common/BUILD.gn
+index f16d2601d6..76f00bfb56 100644
+--- a/third_party/blink/public/common/BUILD.gn
++++ b/third_party/blink/public/common/BUILD.gn
+@@ -150,6 +150,7 @@ source_set("headers") {
+     "fenced_frame/redacted_fenced_frame_config.h",
+     "fenced_frame/redacted_fenced_frame_config_mojom_traits.h",
+     "fetch/fetch_api_request_headers_map.h",
++    "fingerprint/fingerprint_config.h",
+     "fetch/fetch_api_request_headers_mojom_traits.h",
+     "fingerprinting_protection/noise_token.h",
+     "fingerprinting_protection/noise_token_mojom_traits.h",
+diff --git a/third_party/blink/public/common/fingerprint/fingerprint_config.h b/third_party/blink/public/common/fingerprint/fingerprint_config.h
+new file mode 100644
+index 0000000000..5cd248edf3
+--- /dev/null
++++ b/third_party/blink/public/common/fingerprint/fingerprint_config.h
+@@ -0,0 +1,63 @@
++// Copyright 2026 The Chromium Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef THIRD_PARTY_BLINK_PUBLIC_COMMON_FINGERPRINT_FINGERPRINT_CONFIG_H_
++#define THIRD_PARTY_BLINK_PUBLIC_COMMON_FINGERPRINT_FINGERPRINT_CONFIG_H_
++
++#include <stdint.h>
++
++#include <optional>
++#include <string>
++
++#include "base/containers/span.h"
++#include "third_party/blink/public/common/common_export.h"
++
++namespace blink::fingerprint {
++
++// Command-line driven fingerprint configuration. Everything here is inert
++// unless the browser was started with --fingerprint=<seed>; the individual
++// --fingerprint-* overrides are only honoured when a seed is present.
++//
++// All values are read once from the current process' command line (the
++// browser forwards the switches to renderers) and cached, so these functions
++// are cheap and safe to call from any thread.
++
++// True when --fingerprint=<seed> was supplied.
++BLINK_COMMON_EXPORT bool IsEnabled();
++
++// The 64-bit seed derived from --fingerprint. 0 when disabled.
++BLINK_COMMON_EXPORT uint64_t Seed();
++
++// Stateless 64-bit mixer (splitmix64 finalizer) combining the seed with
++// `value`. The same seed and value always produce the same output.
++BLINK_COMMON_EXPORT uint64_t Mix(uint64_t value);
++
++// --fingerprint-hardware-concurrency=<n>
++BLINK_COMMON_EXPORT std::optional<unsigned> HardwareConcurrencyOverride();
++
++// --fingerprint-device-memory=<gb>
++BLINK_COMMON_EXPORT std::optional<float> DeviceMemoryOverride();
++
++// --fingerprint-platform=<navigator.platform value>, e.g. "Win32".
++BLINK_COMMON_EXPORT std::optional<std::string> PlatformOverride();
++
++// --fingerprint-gpu-vendor / --fingerprint-gpu-renderer: values reported
++// through WEBGL_debug_renderer_info.
++BLINK_COMMON_EXPORT std::optional<std::string> GpuVendorOverride();
++BLINK_COMMON_EXPORT std::optional<std::string> GpuRendererOverride();
++
++// Applies seed-keyed noise to a buffer of tightly packed 8-bit, 4-channel
++// pixels (RGBA or BGRA; the alpha channel must be last). The noise is a
++// pure function of (seed, pixel position, pixel value), so reading the same
++// content back twice gives identical results. Fully transparent pixels and
++// pixels inside flat-colour runs are left untouched. No-op when disabled.
++BLINK_COMMON_EXPORT void PerturbPixels8888(base::span<uint8_t> pixels);
++
++// Multiplies every sample by a seed-derived gain that differs from 1.0 by
++// less than 1e-5. No-op when disabled.
++BLINK_COMMON_EXPORT void PerturbAudioSamples(base::span<float> samples);
++
++}  // namespace blink::fingerprint
++
++#endif  // THIRD_PARTY_BLINK_PUBLIC_COMMON_FINGERPRINT_FINGERPRINT_CONFIG_H_
+diff --git a/third_party/blink/public/common/switches.h b/third_party/blink/public/common/switches.h
+index bea5f9bb82..67b04600c0 100644
+--- a/third_party/blink/public/common/switches.h
++++ b/third_party/blink/public/common/switches.h
+@@ -41,6 +41,12 @@ BLINK_COMMON_EXPORT extern const char
+     kEnableOverlaysAndLowLatencyUsageForWebGL[];
+ #endif
+ BLINK_COMMON_EXPORT extern const char kEnableZeroCopy[];
++BLINK_COMMON_EXPORT extern const char kFingerprint[];
++BLINK_COMMON_EXPORT extern const char kFingerprintDeviceMemory[];
++BLINK_COMMON_EXPORT extern const char kFingerprintGpuRenderer[];
++BLINK_COMMON_EXPORT extern const char kFingerprintGpuVendor[];
++BLINK_COMMON_EXPORT extern const char kFingerprintHardwareConcurrency[];
++BLINK_COMMON_EXPORT extern const char kFingerprintPlatform[];
+ BLINK_COMMON_EXPORT extern const char
+     kGpuMemoryBufferReadbackFromTextureForceDisabledForDebugging[];
+ BLINK_COMMON_EXPORT extern const char kGpuRasterizationMSAASampleCount[];
+diff --git a/third_party/blink/renderer/core/execution_context/navigator_base.cc b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+index 83f427c5ec..5c51ac1b6e 100644
+--- a/third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ b/third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -4,9 +4,13 @@
+ 
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
+ 
++#include <optional>
++#include <string>
++
+ #include "base/feature_list.h"
+ #include "build/build_config.h"
+ #include "third_party/blink/public/common/features.h"
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+@@ -67,6 +71,10 @@ String NavigatorBase::userAgent() const {
+ }
+ 
+ String NavigatorBase::platform() const {
++  if (std::optional<std::string> platform_override =
++          fingerprint::PlatformOverride()) {
++    return String::FromUTF8(*platform_override);
++  }
+ #if BUILDFLAG(IS_ANDROID)
+   // We need to check the ReduceUserAgentMinorVersion feature flag for
+   // Android WebView, which does not currently ship a reduced User-Agent.
+diff --git a/third_party/blink/renderer/core/frame/navigator.cc b/third_party/blink/renderer/core/frame/navigator.cc
+index 72964f48db..cb9a19e423 100644
+--- a/third_party/blink/renderer/core/frame/navigator.cc
++++ b/third_party/blink/renderer/core/frame/navigator.cc
+@@ -23,6 +23,7 @@
+ 
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ 
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_controller.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/execution_context/navigator_base.h"
+@@ -79,6 +80,10 @@ bool Navigator::cookieEnabled() const {
+ }
+ 
+ bool Navigator::webdriver() const {
++  if (fingerprint::IsEnabled()) {
++    return false;
++  }
++
+   if (RuntimeEnabledFeatures::AutomationControlledEnabled())
+     return true;
+ 
+diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+index f5c0db2d1b..e9cf9f337d 100644
+--- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
++++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
+@@ -4,11 +4,18 @@
+ 
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+ 
++#include <optional>
++
+ #include "base/system/sys_info.h"
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ 
+ namespace blink {
+ 
+ unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
++  if (std::optional<unsigned> concurrency_override =
++          fingerprint::HardwareConcurrencyOverride()) {
++    return *concurrency_override;
++  }
+   return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
+ }
+ 
+diff --git a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+index b291deceaa..29a06b44e6 100644
+--- a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
++++ b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+@@ -9,6 +9,7 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "base/types/optional_util.h"
+ #include "build/build_config.h"
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/public/platform/task_type.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+@@ -210,6 +211,18 @@ CanvasAsyncBlobCreator::CanvasAsyncBlobCreator(
+       skia_image_->readPixels(info, pixel, info.minRowBytes(), 0, 0);
+     }
+ 
++    // Apply fingerprint noise to a private copy of the pixels; `skia_image_`
++    // may share its backing store with the canvas.
++    if (fingerprint::IsEnabled()) {
++      SkBitmap noisy_bitmap;
++      if (noisy_bitmap.tryAllocPixels(skia_image_->imageInfo()) &&
++          skia_image_->readPixels(noisy_bitmap.pixmap(), 0, 0)) {
++        ImageDataBuffer::ApplyFingerprintNoise(noisy_bitmap.pixmap());
++        noisy_bitmap.setImmutable();
++        skia_image_ = noisy_bitmap.asImage();
++      }
++    }
++
+     if (skia_image_->peekPixels(&src_data_)) {
+       static_bitmap_image_loaded_ = true;
+ 
+diff --git a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+index d2944d4863..41c2f85d4e 100644
+--- a/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
++++ b/third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
+@@ -1478,6 +1478,7 @@ String HTMLCanvasElement::ToDataURLInternal(
+     if (!data_buffer)
+       return String("data:,");
+ 
++    data_buffer->ApplyFingerprintNoise();
+     String data_url = data_buffer->ToDataURL(encoding_mime_type, quality);
+     base::TimeDelta elapsed_time = base::TimeTicks::Now() - start_time;
+     float sqrt_pixels =
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+index 06d1d1e366..1c0c6b4199 100644
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -1646,6 +1646,8 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+       SkIRect bounds =
+           snapshot->PaintImageForCurrentFrame().GetSkImageInfo().bounds();
+       DCHECK(!bounds.intersect(SkIRect::MakeXYWH(sx, sy, sw, sh)));
++    } else {
++      ImageDataBuffer::ApplyFingerprintNoise(image_data->GetSkPixmap());
+     }
+   }
+ 
+diff --git a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+index baf8b320c6..ae41b59581 100644
+--- a/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/offline_audio_context.cc
+@@ -31,6 +31,7 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "media/base/audio_glitch_info.h"
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ #include "third_party/blink/public/platform/platform.h"
+ #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_offline_audio_context_options.h"
+@@ -578,6 +579,12 @@ void OfflineAudioContext::OnChunkRendered() {
+   Member<AudioBuffer> rendered_buffer = pending_render_targets_.front();
+ 
+   CHECK(rendered_buffer);
++  if (fingerprint::IsEnabled()) {
++    for (unsigned i = 0; i < rendered_buffer->numberOfChannels(); ++i) {
++      fingerprint::PerturbAudioSamples(
++          rendered_buffer->getChannelData(i).Get()->AsSpan());
++    }
++  }
+   // Keep the target queued across `Resolve()` so synchronous thenable getters
+   // can enqueue more chunks without starting a duplicate render.
+   resolver->Resolve(rendered_buffer.Get());
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index 61032b09c0..14232b07f7 100644
+--- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -28,11 +28,14 @@
+ #include <inttypes.h>
+ 
+ #include <memory>
++#include <optional>
++#include <string>
+ #include <utility>
+ 
+ #include "base/bit_cast.h"
+ #include "base/byte_size.h"
+ #include "base/compiler_specific.h"
++#include "base/containers/span.h"
+ #include "base/feature_list.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/metrics/histogram_functions.h"
+@@ -64,6 +67,7 @@
+ #include "media/gfx/paint_canvas_video_renderer.h"
+ #include "media/gfx/video_frame_shared_image_cache.h"
+ #include "third_party/blink/public/common/features.h"
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
+ #include "third_party/blink/public/mojom/gpu/gpu.mojom-blink.h"
+ #include "third_party/blink/public/platform/platform.h"
+@@ -4357,6 +4361,10 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        if (std::optional<std::string> renderer_override =
++                fingerprint::GpuRendererOverride()) {
++          return WebGLAny(script_state, String::FromUTF8(*renderer_override));
++        }
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_RENDERER)));
+       }
+@@ -4366,6 +4374,10 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+       return ScriptValue::CreateNull(script_state->GetIsolate());
+     case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
+       if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
++        if (std::optional<std::string> vendor_override =
++                fingerprint::GpuVendorOverride()) {
++          return WebGLAny(script_state, String::FromUTF8(*vendor_override));
++        }
+         return WebGLAny(script_state,
+                         String(ContextGL()->GetString(GL_VENDOR)));
+       }
+@@ -5515,6 +5527,20 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+     }
+     ContextGL()->ReadPixels(x, y, width, height, format, type, data);
+   }
++
++  if (fingerprint::IsEnabled() && format == GL_RGBA &&
++      type == GL_UNSIGNED_BYTE && width > 0 && height > 0) {
++    base::CheckedNumeric<size_t> noise_size = width;
++    noise_size *= height;
++    noise_size *= 4;
++    if (noise_size.IsValid() &&
++        noise_size.ValueOrDie() <= buffer_size.ValueOrDie()) {
++      // SAFETY: `data` points at `buffer_size` writable bytes (validated
++      // above) and `noise_size` does not exceed it.
++      fingerprint::PerturbPixels8888(UNSAFE_BUFFERS(
++          base::span<uint8_t>(data, noise_size.ValueOrDie())));
++    }
++  }
+ }
+ 
+ void WebGLRenderingContextBase::RenderbufferStorageImpl(
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+index 336814dd03..5dc1160c21 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -36,6 +36,7 @@
+ #include "base/logging.h"
+ #include "base/memory/ptr_util.h"
+ #include "base/types/optional_util.h"
++#include "third_party/blink/public/common/fingerprint/fingerprint_config.h"
+ #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
+ #include "third_party/blink/renderer/platform/wtf/text/base64.h"
+ #include "third_party/blink/renderer/platform/wtf/text/strcat.h"
+@@ -141,6 +142,42 @@ base::span<const uint8_t> ImageDataBuffer::PixelData() const {
+   return gfx::SkPixmapToSpan(pixmap_);
+ }
+ 
++// static
++void ImageDataBuffer::ApplyFingerprintNoise(const SkPixmap& pixmap) {
++  if (!fingerprint::IsEnabled() || !pixmap.addr()) {
++    return;
++  }
++  if (pixmap.colorType() != kRGBA_8888_SkColorType &&
++      pixmap.colorType() != kBGRA_8888_SkColorType) {
++    return;
++  }
++  // The noise routine expects tightly packed rows.
++  if (pixmap.rowBytes() != pixmap.info().minRowBytes()) {
++    return;
++  }
++  fingerprint::PerturbPixels8888(gfx::SkPixmapToWritableSpan(pixmap));
++}
++
++void ImageDataBuffer::ApplyFingerprintNoise() {
++  if (!is_valid_ || !fingerprint::IsEnabled()) {
++    return;
++  }
++  const SkImageInfo info = pixmap_.info();
++  const size_t row_bytes = info.minRowBytes();
++  const size_t size = info.computeByteSize(row_bytes);
++  if (SkImageInfo::ByteSizeOverflowed(size)) {
++    return;
++  }
++  sk_sp<SkData> data = SkData::MakeUninitialized(size);
++  SkPixmap copy(info, data->writable_data(), row_bytes);
++  if (!pixmap_.readPixels(copy)) {
++    return;
++  }
++  ApplyFingerprintNoise(copy);
++  pixmap_ = copy;
++  retained_image_ = SkImages::RasterFromData(info, std::move(data), row_bytes);
++}
++
+ bool ImageDataBuffer::EncodeImage(const ImageEncodingMimeType mime_type,
+                                   const double& quality,
+                                   Vector<unsigned char>* encoded_image) const {
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.h b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+index 8bcc28380b..817dcbf8d1 100644
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.h
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+@@ -62,6 +62,15 @@ class PLATFORM_EXPORT ImageDataBuffer {
+ 
+   base::span<const uint8_t> PixelData() const;
+ 
++  // Applies blink::fingerprint pixel noise to `pixmap` in place. `pixmap` must
++  // reference writable memory owned by the caller. Does nothing unless
++  // fingerprint variation is enabled and the pixmap is 8-bit RGBA/BGRA.
++  static void ApplyFingerprintNoise(const SkPixmap& pixmap);
++
++  // Same as above for the pixels held by this buffer. The pixels are copied
++  // first, since they may alias an immutable image.
++  void ApplyFingerprintNoise();
++
+  private:
+   ImageDataBuffer(const SkPixmap&, const gfx::HDRMetadata&);
+   ImageDataBuffer(scoped_refptr<StaticBitmapImage>);
