@@ -3,6 +3,11 @@ name: Build
 on:
   workflow_dispatch:
 
+# Stage 1 reads artifacts of earlier runs to reuse their build tree.
+permissions:
+  contents: read
+  actions: read
+
 # A Chromium build does not fit in one 6-hour job, so it is split into
 # stages. Each stage builds for a fixed time budget, then hands the whole
 # tree (sources + out/) to the next stage as an artifact. Stages after the

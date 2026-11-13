@@ -53,6 +53,9 @@ jobs:
         run: |
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
           "C:\depot_tools" >> $env:GITHUB_PATH
+          # First use bootstraps depot_tools' own python and git.
+          $env:Path = "C:\depot_tools;$env:Path"
+          cmd /c "gclient --version"
 
       - name: Install Windows SDK 10.0.28000
         run: |
@@ -70,8 +73,46 @@ jobs:
           Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" | Select-Object Name
           if (-not (Test-Path $inc)) { throw "Windows SDK 10.0.28000.0 is not installed" }
 
-      - name: Fetch Chromium and apply patches
+      # Cross-run cache: the first stage starts from the most recent tree
+      # uploaded by an earlier run (finished, interrupted or failed), as long
+      # as it was built from the same Chromium commit. Only files whose
+      # patched content changed are then recompiled.
+      - name: Restore tree from an earlier run
+        id: cache
         if: inputs.stage == 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $restored = 'false'
+          try {
+            $commit = (Get-Content repo\chromium_commit.txt -Raw).Trim()
+            $artifacts = gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | {id, name, expired, created_at, run_id: .workflow_run.id}]' | ConvertFrom-Json
+            $artifact = $artifacts |
+              Where-Object { $_.name -like 'build-state-*' -and -not $_.expired -and "$($_.run_id)" -ne $env:GITHUB_RUN_ID } |
+              Sort-Object created_at -Descending | Select-Object -First 1
+            if (-not $artifact) { throw "no earlier build state found" }
+            Write-Host "Restoring $($artifact.name) from run $($artifact.run_id)"
+            gh run download $artifact.run_id --repo $env:GITHUB_REPOSITORY -n $artifact.name -D D:\state
+            if ($LASTEXITCODE -ne 0) { throw "download failed" }
+            New-Item -ItemType Directory -Force $env:ROOT | Out-Null
+            7z x D:\state\state.7z "-o$env:ROOT" -y -bso0 -bsp0
+            if ($LASTEXITCODE -ne 0) { throw "extract failed" }
+            Remove-Item -Recurse -Force D:\state
+            $cached = if (Test-Path "$env:ROOT\cache_commit.txt") { (Get-Content "$env:ROOT\cache_commit.txt" -Raw).Trim() } else { '' }
+            if ($cached -ne $commit) { throw "cached tree is for commit '$cached', need '$commit'" }
+            & repo\scripts\update_patches.ps1 -Root $env:ROOT -NewPatches "$env:GITHUB_WORKSPACE\repo\patches"
+            $restored = 'true'
+          } catch {
+            Write-Host "Not using a cached tree: $_"
+            foreach ($path in $env:ROOT, 'D:\state') {
+              if (Test-Path $path) { cmd /c "rmdir /s /q `"$path`"" }
+            }
+          }
+          "restored=$restored" >> $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Fetch Chromium and apply patches
+        if: inputs.stage == 1 && steps.cache.outputs.restored != 'true'
         run: |
           $commit = (Get-Content repo\chromium_commit.txt -Raw).Trim()
           New-Item -ItemType Directory -Force $env:ROOT | Out-Null
@@ -94,7 +135,7 @@ jobs:
               "custom_vars": {},
             },
           ]
-          '@ -replace '(?m)^          ', '' | Set-Content -Encoding ascii .gclient
+          '@ | Set-Content -Encoding ascii .gclient
           cmd /c "gclient sync --no-history -D"
           if ($LASTEXITCODE -ne 0) { throw "gclient sync failed" }
           Set-Location src
@@ -103,10 +144,10 @@ jobs:
             git apply --whitespace=nowarn $_.FullName
             if ($LASTEXITCODE -ne 0) { throw "failed to apply $($_.Name)" }
           }
-          New-Item -ItemType Directory -Force out\Release | Out-Null
-          Copy-Item "$env:GITHUB_WORKSPACE\repo\args.gn" out\Release\args.gn
-          cmd /c "gn gen out\Release"
-          if ($LASTEXITCODE -ne 0) { throw "gn gen failed" }
+          # Recorded so that a later run can reuse this tree as a cache.
+          Set-Content -Encoding ascii "$env:ROOT\cache_commit.txt" $commit
+          New-Item -ItemType Directory -Force "$env:ROOT\applied_patches" | Out-Null
+          Copy-Item "$env:GITHUB_WORKSPACE\repo\patches\*.patch" "$env:ROOT\applied_patches"
 
       - name: Download previous stage
         if: inputs.stage > 1
@@ -122,6 +163,19 @@ jobs:
           7z x D:\state\state.7z "-o$env:ROOT" -y -bso0 -bsp0
           if ($LASTEXITCODE -ne 0) { throw "extract failed" }
           Remove-Item -Recurse -Force D:\state
+
+      - name: Generate build files
+        if: inputs.stage == 1
+        run: |
+          Set-Location "$env:ROOT\src"
+          New-Item -ItemType Directory -Force out\Release | Out-Null
+          $args_new = Get-Content "$env:GITHUB_WORKSPACE\repo\args.gn" -Raw
+          $args_old = if (Test-Path out\Release\args.gn) { Get-Content out\Release\args.gn -Raw } else { '' }
+          if ($args_new -ne $args_old) {
+            Copy-Item "$env:GITHUB_WORKSPACE\repo\args.gn" out\Release\args.gn
+          }
+          cmd /c "gn gen out\Release"
+          if ($LASTEXITCODE -ne 0) { throw "gn gen failed" }
 
       - name: Build
         id: build
@@ -154,6 +208,7 @@ jobs:
             Write-Host "Build failed with exit code $($p.ExitCode)"
             Select-String -Path $log -Pattern 'error:|FAILED:' -Context 0, 12 | Select-Object -First 40 | ForEach-Object { $_.ToString() }
             Get-Content $log -Tail 60
+            "finished=failed" >> $env:GITHUB_OUTPUT
             exit 1
           }
           "finished=true" >> $env:GITHUB_OUTPUT
@@ -166,23 +221,6 @@ jobs:
           path: D:\c\build.log
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: Archive tree for next stage
-        if: steps.build.outputs.finished == 'false'
-        run: |
-          Set-Location $env:ROOT
-          7z a -t7z -mx=1 -mmt=on D:\state.7z src .gclient .gclient_entries "-xr!.git" -bso0 -bsp0
-          if ($LASTEXITCODE -gt 1) { throw "archive failed" }
-          "{0:N1} GB" -f ((Get-Item D:\state.7z).Length / 1GB)
-
-      - name: Upload tree for next stage
-        if: steps.build.outputs.finished == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-state-${{ inputs.stage }}
-          path: D:\state.7z
-          compression-level: 0
-          retention-days: 1
 
       - name: Package chrome
         if: steps.build.outputs.finished == 'true'
@@ -208,3 +246,23 @@ jobs:
           path: D:\pkg\chrome-win64.zip
           compression-level: 0
           retention-days: 14
+
+      # The tree is uploaded whatever the outcome: an interrupted build hands
+      # it to the next stage, and a finished or failed one leaves it as the
+      # cache for the next run.
+      - name: Archive tree
+        if: always() && steps.build.outputs.finished != ''
+        run: |
+          Set-Location $env:ROOT
+          7z a -t7z -mx=1 -mmt=on D:\state.7z src .gclient .gclient_entries cache_commit.txt applied_patches "-xr!.git" -bso0 -bsp0
+          if ($LASTEXITCODE -gt 1) { throw "archive failed" }
+          "{0:N1} GB" -f ((Get-Item D:\state.7z).Length / 1GB)
+
+      - name: Upload tree
+        if: always() && steps.build.outputs.finished != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-state-${{ inputs.stage }}
+          path: D:\state.7z
+          compression-level: 0
+          retention-days: 5
