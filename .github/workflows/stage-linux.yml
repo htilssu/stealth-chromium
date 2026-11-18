@@ -152,8 +152,10 @@ jobs:
       - name: Install Chromium build dependencies
         run: |
           cd "$ROOT/src"
+          # The .sh wrapper is a Python-2-style exec and does not parse
+          # under python3, so call the Python script directly.
           # Fresh runner on every stage, so this runs on each one.
-          sudo python3 build/install-build-deps.sh
+          sudo python3 build/install-build-deps.py
 
       - name: Download previous stage
         if: inputs.stage > 1
