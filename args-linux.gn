@@ -1,0 +1,12 @@
+# Linux x64 release build. Mirrors args.gn; adjust here if the Linux build
+# needs different settings (e.g. use_system_libs, ffmpeg_branding).
+is_debug = false
+is_component_build = false
+dcheck_always_on = false
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+target_cpu = "x64"
+chrome_pgo_phase = 0
+treat_warnings_as_errors = false
+concurrent_links = 1

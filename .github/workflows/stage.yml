@@ -88,7 +88,11 @@ jobs:
             $commit = (Get-Content repo\chromium_commit.txt -Raw).Trim()
             $artifacts = gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '[.artifacts[] | {id, name, expired, created_at, run_id: .workflow_run.id}]' | ConvertFrom-Json
             $artifact = $artifacts |
-              Where-Object { $_.name -like 'build-state-*' -and -not $_.expired -and "$($_.run_id)" -ne $env:GITHUB_RUN_ID } |
+              Where-Object {
+                $_.name -like 'build-state-*' -and
+                $_.name -notlike 'build-state-linux-*' -and
+                -not $_.expired -and "$($_.run_id)" -ne $env:GITHUB_RUN_ID
+              } |
               Sort-Object created_at -Descending | Select-Object -First 1
             if (-not $artifact) { throw "no earlier build state found" }
             Write-Host "Restoring $($artifact.name) from run $($artifact.run_id)"

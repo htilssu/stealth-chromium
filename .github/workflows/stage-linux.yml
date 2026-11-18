@@ -1,0 +1,294 @@
+name: Build stage (Linux)
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        required: true
+        type: number
+      previous:
+        description: Stage whose tree is restored (0 for the first stage)
+        required: true
+        type: number
+    outputs:
+      finished:
+        description: "'true' when chrome finished building in this stage"
+        value: ${{ jobs.build.outputs.finished }}
+
+env:
+  GCLIENT_SUPPRESS_GIT_VERSION_WARNING: 1
+  # Off the workspace: shorter paths than /home/runner/work/<repo>/<repo>.
+  ROOT: /home/runner/build
+  STATE: /home/runner/state
+  PKG: /home/runner/pkg
+  # Minutes after job start at which the build is interrupted, leaving time
+  # to archive and upload the tree before the 6-hour job limit.
+  BUILD_DEADLINE_MINUTES: 235
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.build.outputs.finished }}
+    steps:
+      - name: Record job start
+        run: |
+          echo "JOB_START=$(date -u +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_ENV"
+          df -h
+          nproc
+          free -h
+
+      - uses: actions/checkout@v4
+        with:
+          path: repo
+
+      - name: Git settings
+        run: git config --global advice.detachedHead false
+
+      - name: Install 7zip, zip, and depot_tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq 7zip zip
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+          # Ubuntu 24.04's 7zip package provides 7zz; older images use 7z.
+          if command -v 7zz >/dev/null 2>&1; then echo "ZBIN=7zz" >> "$GITHUB_ENV"
+          elif command -v 7z  >/dev/null 2>&1; then echo "ZBIN=7z"  >> "$GITHUB_ENV"
+          else echo "no 7-zip binary found"; exit 1; fi
+
+      # Cross-run cache: the first stage starts from the most recent Linux
+      # tree uploaded by an earlier run (finished, interrupted or failed), as
+      # long as it was built from the same Chromium commit. Only files whose
+      # patched content changed are then recompiled.
+      - name: Restore tree from an earlier run
+        id: cache
+        if: inputs.stage == 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          restored='false'
+          if (
+            set -e
+            commit=$(tr -d '[:space:]' < repo/chromium_commit.txt)
+            row=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" |
+              jq -r --arg run "$GITHUB_RUN_ID" '
+                [ .artifacts[]
+                  | select(.name | test("^build-state-linux-[0-9]+$"))
+                  | select(.expired | not)
+                  | select((.workflow_run.id | tostring) != $run)
+                ]
+                | if length == 0 then empty else sort_by(.created_at) | reverse | .[0] end
+                | "\(.name)\n\(.workflow_run.id)"
+              ' | head -n 3)
+            name=$(printf '%s\n' "$row" | sed -n 1p)
+            run_id=$(printf '%s\n' "$row" | sed -n 2p)
+            if [ -z "$name" ]; then echo "no earlier build state found"; exit 1; fi
+            echo "Restoring $name from run $run_id"
+            mkdir -p "$STATE"
+            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n "$name" -D "$STATE"
+            mkdir -p "$ROOT"
+            set +e
+            "$ZBIN" x "$STATE/state.7z" "-o$ROOT" -y -bso0 -bsp0
+            rc=$?
+            set -e
+            if [ "$rc" -gt 1 ]; then echo "extract failed"; exit 1; fi
+            rm -rf "$STATE"
+            cached=''
+            if [ -f "$ROOT/cache_commit.txt" ]; then
+              cached=$(tr -d '[:space:]' < "$ROOT/cache_commit.txt")
+            fi
+            if [ "$cached" != "$commit" ]; then
+              echo "cached tree is for commit '$cached', need '$commit'"
+              exit 1
+            fi
+            bash repo/scripts/update_patches.sh "$ROOT" "$GITHUB_WORKSPACE/repo/patches"
+          ); then
+            restored='true'
+          else
+            echo "Not using a cached tree"
+            rm -rf "$ROOT" "$STATE"
+          fi
+          echo "restored=$restored" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch Chromium and apply patches
+        if: inputs.stage == 1 && steps.cache.outputs.restored != 'true'
+        run: |
+          set -euo pipefail
+          commit=$(tr -d '[:space:]' < repo/chromium_commit.txt)
+          mkdir -p "$ROOT"
+          cd "$ROOT"
+          git init -q src
+          cd src
+          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          git fetch --depth 1 origin "$commit"
+          git checkout -q FETCH_HEAD
+          cd "$ROOT"
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": "src",
+              "url": "https://chromium.googlesource.com/chromium/src.git",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {},
+            },
+          ]
+          EOF
+          if ! gclient sync --no-history -D; then echo "gclient sync failed"; exit 1; fi
+          cd "$ROOT/src"
+          for p in "$GITHUB_WORKSPACE/repo/patches"/*.patch; do
+            echo "Applying $(basename "$p")"
+            if ! git apply --whitespace=nowarn "$p"; then
+              echo "failed to apply $(basename "$p")"
+              exit 1
+            fi
+          done
+          # Recorded so that a later run can reuse this tree as a cache.
+          echo "$commit" > "$ROOT/cache_commit.txt"
+          mkdir -p "$ROOT/applied_patches"
+          cp "$GITHUB_WORKSPACE/repo/patches/"*.patch "$ROOT/applied_patches/"
+
+      - name: Install Chromium build dependencies
+        run: |
+          cd "$ROOT/src"
+          # Fresh runner on every stage, so this runs on each one.
+          sudo python3 build/install-build-deps.sh
+
+      - name: Download previous stage
+        if: inputs.stage > 1
+        uses: actions/download-artifact@v4
+        with:
+          name: build-state-linux-${{ inputs.previous }}
+          path: ${{ env.STATE }}
+
+      - name: Restore previous stage
+        if: inputs.stage > 1
+        run: |
+          set -euo pipefail
+          mkdir -p "$ROOT"
+          rc=0
+          set +e
+          "$ZBIN" x "$STATE/state.7z" "-o$ROOT" -y -bso0 -bsp0
+          rc=$?
+          set -e
+          if [ "$rc" -gt 1 ]; then echo "extract failed"; exit 1; fi
+          rm -rf "$STATE"
+
+      - name: Generate build files
+        if: inputs.stage == 1
+        run: |
+          set -euo pipefail
+          cd "$ROOT/src"
+          mkdir -p out/Release
+          args_new=$(cat "$GITHUB_WORKSPACE/repo/args-linux.gn")
+          args_old=''
+          if [ -f out/Release/args.gn ]; then args_old=$(cat out/Release/args.gn); fi
+          if [ "$args_new" != "$args_old" ]; then
+            cp "$GITHUB_WORKSPACE/repo/args-linux.gn" out/Release/args.gn
+          fi
+          if ! gn gen out/Release; then echo "gn gen failed"; exit 1; fi
+
+      - name: Build
+        id: build
+        run: |
+          set -euo pipefail
+          cd "$ROOT/src"
+          log="$ROOT/build.log"
+          deadline=$(( $(date +%s) + ${BUILD_DEADLINE_MINUTES} * 60 ))
+          autoninja -C out/Release chrome > "$log" 2>&1 &
+          PID=$!
+          tick=0
+          while kill -0 "$PID" 2>/dev/null; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "Time budget reached; interrupting the build."
+              kill -TERM "$PID" 2>/dev/null || true
+              sleep 10
+              pkill -TERM -f 'out/Release' 2>/dev/null || true
+              sleep 5
+              pkill -KILL -f 'out/Release' 2>/dev/null || true
+              echo "finished=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 30
+            tick=$((tick + 1))
+            if [ $((tick % 10)) -eq 0 ] && [ -f "$log" ]; then
+              tail -n 2 "$log"
+            fi
+          done
+          rc=0
+          wait "$PID" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "Build failed with exit code $rc"
+            grep -n -E 'error:|FAILED:' "$log" | head -n 40 || true
+            tail -n 60 "$log" || true
+            echo "finished=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "finished=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-linux-${{ inputs.stage }}
+          path: ${{ env.ROOT }}/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Package chrome
+        if: steps.build.outputs.finished == 'true'
+        run: |
+          set -euo pipefail
+          out="$ROOT/src/out/Release"
+          dst="$PKG/chrome"
+          mkdir -p "$dst"
+          for f in chrome chrome_crashpad_handler; do
+            if [ -f "$out/$f" ]; then cp "$out/$f" "$dst/"; fi
+          done
+          # chrome-sandbox is a copy of chrome used for the SUID sandbox.
+          cp "$dst/chrome" "$dst/chrome-sandbox"
+          for pat in '*.so' '*.so.*' '*.pak' '*.bin' '*.dat' '*.json'; do
+            cp -f "$out"/$pat "$dst/" 2>/dev/null || true
+          done
+          for d in locales MEIPreload IwaKeyDistribution PrivacySandboxAttestationsPreloaded; do
+            if [ -d "$out/$d" ]; then cp -r "$out/$d" "$dst/"; fi
+          done
+          cd "$PKG"
+          zip -qr chrome-linux64.zip chrome
+          du -h chrome-linux64.zip
+
+      - name: Upload chrome
+        if: steps.build.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-linux64
+          path: ${{ env.PKG }}/chrome-linux64.zip
+          compression-level: 0
+          retention-days: 14
+
+      # The tree is uploaded whatever the outcome: an interrupted build hands
+      # it to the next stage, and a finished or failed one leaves it as the
+      # cache for the next run.
+      - name: Archive tree
+        if: always() && steps.build.outputs.finished != ''
+        run: |
+          set -euo pipefail
+          cd "$ROOT"
+          rc=0
+          set +e
+          "$ZBIN" a -mx=1 -mmt=on "$HOME/state.7z" src .gclient .gclient_entries cache_commit.txt applied_patches "-xr!.git" -bso0 -bsp0
+          rc=$?
+          set -e
+          if [ "$rc" -gt 1 ]; then echo "archive failed"; exit 1; fi
+          du -h "$HOME/state.7z"
+          # 7z exits with 1 for warnings (dangling symlinks in the tree).
+
+      - name: Upload tree
+        if: always() && steps.build.outputs.finished != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-state-linux-${{ inputs.stage }}
+          path: /home/runner/state.7z
+          compression-level: 0
+          retention-days: 5

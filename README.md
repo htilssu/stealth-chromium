@@ -1,17 +1,26 @@
 # stealth-chromium
 
-Patches for Chromium that add seed-keyed fingerprint variation, plus a GitHub
-Actions workflow that builds a Windows x64 `chrome` with them applied.
+Patches for Chromium that add seed-keyed fingerprint variation, plus GitHub
+Actions workflows that build `chrome` with them applied for Windows x64 and
+Linux x64.
 
 - `chromium_commit.txt` — the Chromium commit the patches apply to.
 - `patches/` — applied in name order with `git apply`.
-- `args.gn` — GN build arguments.
+- `args.gn` — GN build arguments for the Windows build.
+- `args-linux.gn` — GN build arguments for the Linux build.
 
 ## Building
 
-Run the **Build** workflow manually (Actions → Build → Run workflow). The build
-is split into up to 8 stages of just under 6 hours each; the finished browser
-is uploaded as the `chrome-win64` artifact.
+Run the **Build** (Windows) or **Build (Linux)** workflow manually
+(Actions → Build → Run workflow). Each build is split into up to 8 stages of
+just under 6 hours each; the finished browser is uploaded as the
+`chrome-win64` or `chrome-linux64` artifact. The two workflows keep separate
+build trees, so they can run side by side.
+
+The Linux stages run on GitHub-hosted `ubuntu-latest` runners, which have far
+less disk than the Windows `D:` drive. A full Chromium tree may not fit; if a
+stage's disk runs out, switch `runs-on` in `stage-linux.yml` to a
+self-hosted Linux runner with ~100 GB free.
 
 ## Usage
 
