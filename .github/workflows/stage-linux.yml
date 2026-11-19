@@ -149,14 +149,6 @@ jobs:
           mkdir -p "$ROOT/applied_patches"
           cp "$GITHUB_WORKSPACE/repo/patches/"*.patch "$ROOT/applied_patches/"
 
-      - name: Install Chromium build dependencies
-        run: |
-          cd "$ROOT/src"
-          # The .sh wrapper is a Python-2-style exec and does not parse
-          # under python3, so call the Python script directly.
-          # Fresh runner on every stage, so this runs on each one.
-          sudo python3 build/install-build-deps.py
-
       - name: Download previous stage
         if: inputs.stage > 1
         uses: actions/download-artifact@v4
@@ -176,6 +168,15 @@ jobs:
           set -e
           if [ "$rc" -gt 1 ]; then echo "extract failed"; exit 1; fi
           rm -rf "$STATE"
+
+      - name: Install Chromium build dependencies
+        run: |
+          cd "$ROOT/src"
+          # The .sh wrapper is a Python-2-style exec and does not parse
+          # under python3, so call the Python script directly.
+          # Fresh runner on every stage, so this runs on each one, after the
+          # tree has been fetched (stage 1) or restored (later stages).
+          sudo python3 build/install-build-deps.py
 
       - name: Generate build files
         if: inputs.stage == 1
