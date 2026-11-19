@@ -52,6 +52,10 @@ jobs:
           sudo apt-get install -y -qq 7zip zip
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
           echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+          # First use bootstraps depot_tools' own python. Needed because a
+          # restored tree (cache or later stage) skips gclient sync, and gn /
+          # autoninja fail with "python3_bin_reldir.txt not found" otherwise.
+          "$HOME/depot_tools/gclient" --version
           # Ubuntu 24.04's 7zip package provides 7zz; older images use 7z.
           if command -v 7zz >/dev/null 2>&1; then echo "ZBIN=7zz" >> "$GITHUB_ENV"
           elif command -v 7z  >/dev/null 2>&1; then echo "ZBIN=7z"  >> "$GITHUB_ENV"
