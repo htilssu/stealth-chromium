@@ -49,7 +49,7 @@ jobs:
       - name: Install 7zip, zip, and depot_tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq 7zip zip
+          sudo apt-get install -y -qq 7zip zip zstd
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
           echo "$HOME/depot_tools" >> "$GITHUB_PATH"
           # First use bootstraps depot_tools' own python. Needed because a
@@ -91,12 +91,7 @@ jobs:
             echo "Restoring $name from run $run_id"
             mkdir -p "$STATE"
             gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n "$name" -D "$STATE"
-            mkdir -p "$ROOT"
-            set +e
-            "$ZBIN" x "$STATE/state.7z" "-o$ROOT" -y -bso0 -bsp0
-            rc=$?
-            set -e
-            if [ "$rc" -gt 1 ]; then echo "extract failed"; exit 1; fi
+            bash repo/scripts/extract_state.sh "$STATE" "$ROOT"
             rm -rf "$STATE"
             cached=''
             if [ -f "$ROOT/cache_commit.txt" ]; then
@@ -164,14 +159,10 @@ jobs:
         if: inputs.stage > 1
         run: |
           set -euo pipefail
-          mkdir -p "$ROOT"
-          rc=0
-          set +e
-          "$ZBIN" x "$STATE/state.7z" "-o$ROOT" -y -bso0 -bsp0
-          rc=$?
-          set -e
-          if [ "$rc" -gt 1 ]; then echo "extract failed"; exit 1; fi
+          bash repo/scripts/extract_state.sh "$STATE" "$ROOT"
           rm -rf "$STATE"
+          # Siso's state must have survived for the build to resume.
+          ls -la "$ROOT/src/out/Release/" | grep -i siso || echo "WARNING: no siso state in restored tree"
 
       - name: Install Chromium build dependencies
         run: |
@@ -203,17 +194,29 @@ jobs:
           cd "$ROOT/src"
           log="$ROOT/build.log"
           deadline=$(( $(date +%s) + ${BUILD_DEADLINE_MINUTES} * 60 ))
-          autoninja -C out/Release chrome > "$log" 2>&1 &
+          # Own process group, so the interrupt reaches siso and not just
+          # the autoninja wrapper.
+          setsid autoninja -C out/Release chrome > "$log" 2>&1 &
           PID=$!
           tick=0
           while kill -0 "$PID" 2>/dev/null; do
             if [ "$(date +%s)" -ge "$deadline" ]; then
               echo "Time budget reached; interrupting the build."
-              kill -TERM "$PID" 2>/dev/null || true
-              sleep 10
-              pkill -TERM -f 'out/Release' 2>/dev/null || true
-              sleep 5
-              pkill -KILL -f 'out/Release' 2>/dev/null || true
+              # SIGINT lets siso cancel running steps and flush its state
+              # (.siso_fs_state, deps). Killing it early loses that state
+              # and the next stage recompiles nearly everything.
+              kill -INT -- "-$PID" 2>/dev/null || true
+              for _ in $(seq 1 60); do
+                kill -0 "$PID" 2>/dev/null || break
+                sleep 5
+              done
+              if kill -0 "$PID" 2>/dev/null; then
+                echo "Build still running after 5 minutes; killing it."
+                kill -KILL -- "-$PID" 2>/dev/null || true
+              fi
+              wait "$PID" 2>/dev/null || true
+              tail -n 5 "$log" || true
+              ls -la out/Release/ | grep -i siso || true
               echo "finished=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -239,7 +242,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log-linux-${{ inputs.stage }}
-          path: ${{ env.ROOT }}/build.log
+          path: |
+            ${{ env.ROOT }}/build.log
+            ${{ env.ROOT }}/src/out/Release/siso.INFO
+            ${{ env.ROOT }}/src/out/Release/siso.WARNING
           if-no-files-found: ignore
           retention-days: 7
 
@@ -282,20 +288,25 @@ jobs:
         run: |
           set -euo pipefail
           cd "$ROOT"
+          # tar in POSIX format keeps nanosecond mtimes, which siso compares
+          # against its saved state; 7z rounds them and makes files look
+          # changed.
           rc=0
           set +e
-          "$ZBIN" a -mx=1 -mmt=on "$HOME/state.7z" src .gclient .gclient_entries cache_commit.txt applied_patches "-xr!.git" -bso0 -bsp0
+          tar --format=posix --pax-option=delete=atime,delete=ctime \
+            --exclude=.git -I 'zstd -T0 -3' -cf "$HOME/state.tar.zst" \
+            src .gclient .gclient_entries cache_commit.txt applied_patches
           rc=$?
           set -e
+          # tar exits with 1 when some files changed or vanished while read.
           if [ "$rc" -gt 1 ]; then echo "archive failed"; exit 1; fi
-          du -h "$HOME/state.7z"
-          # 7z exits with 1 for warnings (dangling symlinks in the tree).
+          du -h "$HOME/state.tar.zst"
 
       - name: Upload tree
         if: always() && steps.build.outputs.finished != ''
         uses: actions/upload-artifact@v4
         with:
           name: build-state-linux-${{ inputs.stage }}
-          path: /home/runner/state.7z
+          path: /home/runner/state.tar.zst
           compression-level: 0
           retention-days: 5
